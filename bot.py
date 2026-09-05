@@ -4,6 +4,7 @@ import json
 import asyncio
 import random
 import requests
+import re
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
@@ -18,7 +19,8 @@ def load_data():
         with open(DATA_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
     return {
-        "accounts": [],  # [{"name": "Аккаунт 1", "access_token": "...", "refresh_token": "...", "expires_at": "..."}]
+        "accounts": [],  # [{"access_token": "...", "proxy": "...", "name": "..."}]
+        "proxies": [],   # ["http://user:pass@ip:port", ...]
         "texts": [],
         "ads": [],
         "delay": 5
@@ -35,6 +37,7 @@ def main_menu():
     keyboard = [
         [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
         [InlineKeyboardButton("👤 Управление токенами", callback_data="accounts_menu")],
+        [InlineKeyboardButton("🌐 Управление прокси", callback_data="proxies_menu")],
         [InlineKeyboardButton("📝 Управление текстами", callback_data="texts_menu")],
         [InlineKeyboardButton("⏱ Задержка", callback_data="delay_menu")],
         [InlineKeyboardButton("📤 Загрузить CSV", callback_data="upload_csv")],
@@ -46,72 +49,96 @@ def main_menu():
 def back_button():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]])
 
-# ===== ФУНКЦИИ ОТПРАВКИ ЧЕРЕЗ OLX API =====
-def get_valid_token(account):
-    """Проверяет токен и обновляет если нужно"""
-    if not account.get('expires_at'):
-        return account.get('access_token')
+# ===== ФУНКЦИИ РАБОТЫ С OLX API =====
+def extract_ad_id_from_url(url):
+    if not url:
+        return None
+    match = re.search(r'-([A-Za-z0-9]+)\.html$', url)
+    if match:
+        return match.group(1)
+    return None
+
+def get_account_name(access_token, proxy=None):
+    """Получает имя пользователя через OLX API"""
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json"
+    }
+    
+    proxies = None
+    if proxy:
+        proxies = {"http": proxy, "https": proxy}
     
     try:
-        expires_at = datetime.fromisoformat(account['expires_at'])
-        if datetime.now() >= expires_at:
-            # Обновляем токен
-            response = requests.post(
-                "https://www.olx.ro/api/open/oauth/token",
-                data={
-                    "grant_type": "refresh_token",
-                    "refresh_token": account['refresh_token'],
-                    "client_id": account.get('client_id', ''),
-                    "client_secret": account.get('client_secret', '')
-                }
-            )
-            if response.status_code == 200:
-                result = response.json()
-                account['access_token'] = result.get('access_token')
-                account['refresh_token'] = result.get('refresh_token', account['refresh_token'])
-                account['expires_at'] = (datetime.now() + timedelta(seconds=result.get('expires_in', 3600))).isoformat()
-                save_data(data)
-                return account['access_token']
-        return account['access_token']
-    except:
-        return account.get('access_token')
+        session = requests.Session()
+        if proxies:
+            session.proxies.update(proxies)
+        
+        response = session.get(
+            "https://www.olx.ro/api/partner/users/me",
+            headers=headers,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            name = data.get('display_name') or data.get('name') or data.get('email', 'Без имени')
+            return name
+        else:
+            return f"Аккаунт {len(data['accounts']) + 1}"
+    except Exception as e:
+        return f"Аккаунт {len(data['accounts']) + 1}"
 
-def send_message_via_api(access_token, ad_id, message_text):
-    """Отправляет сообщение в чат объявления"""
+def send_message_via_api(access_token, ad_id, message_text, proxy=None):
+    """Отправляет сообщение через OLX API"""
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
         "Accept": "application/json"
     }
     
+    proxies = None
+    if proxy:
+        proxies = {"http": proxy, "https": proxy}
+    
     try:
-        # Пробуем отправить сообщение напрямую
-        response = requests.post(
+        session = requests.Session()
+        if proxies:
+            session.proxies.update(proxies)
+        
+        response = session.post(
             f"https://www.olx.ro/api/partner/ads/{ad_id}/threads",
             headers=headers,
-            json={"message": {"text": message_text}}
+            json={"message": {"text": message_text}},
+            timeout=30
         )
+        
         if response.status_code == 201:
             return {"success": True}
         elif response.status_code == 409:
-            # Чат уже существует — ищем его
-            threads = requests.get(
+            threads = session.get(
                 f"https://www.olx.ro/api/partner/ads/{ad_id}/threads",
-                headers=headers
+                headers=headers,
+                timeout=30
             )
             if threads.status_code == 200:
                 thread_data = threads.json()
                 if thread_data.get('data') and len(thread_data['data']) > 0:
                     thread_id = thread_data['data'][0].get('id')
                     if thread_id:
-                        msg_response = requests.post(
+                        msg_response = session.post(
                             f"https://www.olx.ro/api/partner/threads/{thread_id}/messages",
                             headers=headers,
-                            json={"text": message_text}
+                            json={"text": message_text},
+                            timeout=30
                         )
                         if msg_response.status_code == 201:
                             return {"success": True}
         return {"error": f"Ошибка {response.status_code}: {response.text[:200]}"}
+    except requests.exceptions.Timeout:
+        return {"error": "Таймаут соединения"}
+    except requests.exceptions.ProxyError:
+        return {"error": "Ошибка прокси"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -120,10 +147,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 <b>OLX Рассыльщик</b>\n\n"
         "📌 Бот рассылает сообщения в чаты OLX\n\n"
-        "1️⃣ Добавьте access_token аккаунтов OLX\n"
-        "2️⃣ Загрузите CSV с ID объявлений\n"
-        "3️⃣ Добавьте тексты\n"
-        "4️⃣ Начните рассылку",
+        "1️⃣ Добавьте токены аккаунтов\n"
+        "2️⃣ Добавьте прокси (необязательно)\n"
+        "3️⃣ Загрузите CSV с объявлениями\n"
+        "4️⃣ Добавьте тексты\n"
+        "5️⃣ Начните рассылку",
         parse_mode='HTML',
         reply_markup=main_menu()
     )
@@ -139,6 +167,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"📊 <b>Статистика</b>\n\n"
             f"👤 Токенов: <b>{len(data['accounts'])}</b>\n"
+            f"🌐 Прокси: <b>{len(data['proxies'])}</b>\n"
             f"📝 Текстов: <b>{len(data['texts'])}</b>\n"
             f"📦 Объявлений: <b>{len(data['ads'])}</b>\n"
             f"⏱ Задержка: <b>{data.get('delay', 5)} сек</b>",
@@ -152,14 +181,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("➕ Добавить токен", callback_data="add_account")],
             [InlineKeyboardButton("📋 Список токенов", callback_data="list_accounts")],
             [InlineKeyboardButton("🗑️ Удалить токен", callback_data="delete_account")],
+            [InlineKeyboardButton("🔄 Привязать прокси к токенам", callback_data="assign_proxies")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]
         ]
         await query.edit_message_text(
             f"👤 <b>Управление токенами</b>\n\n"
             f"Всего: {len(data['accounts'])}\n\n"
-            "Введите access_token аккаунта OLX в формате:\n"
-            "<code>Название|access_token</code>\n\n"
-            "Пример: <code>Мой аккаунт|abc123xyz456</code>",
+            "Просто отправьте токен в чат — имя подтянется автоматически.",
             parse_mode='HTML',
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -167,9 +195,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "add_account":
         context.user_data['action'] = 'add_account'
         await query.edit_message_text(
-            "✏️ <b>Введите токен</b>\n\n"
-            "Формат: <code>Название|access_token</code>\n\n"
-            "Пример: <code>Аккаунт 1|eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...</code>",
+            "✏️ <b>Введите access_token</b>\n\n"
+            "Просто отправьте токен.\n"
+            "Имя аккаунта будет получено автоматически.",
             parse_mode='HTML',
             reply_markup=back_button()
         )
@@ -181,7 +209,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = ""
         for i, acc in enumerate(data['accounts']):
             token_short = acc['access_token'][:15] + "..." if len(acc['access_token']) > 20 else acc['access_token']
-            text += f"{i+1}. {acc.get('name', 'Без имени')}\n   <code>{token_short}</code>\n"
+            proxy_status = "🌐" if acc.get('proxy') else "❌"
+            name = acc.get('name', 'Без имени')
+            text += f"{i+1}. {name} {proxy_status}\n   <code>{token_short}</code>\n"
         await query.edit_message_text(f"📋 <b>Токены</b>\n\n{text}", parse_mode='HTML', reply_markup=back_button())
     
     elif query.data == "delete_account":
@@ -200,6 +230,87 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data['accounts'].pop(idx)
         save_data(data)
         await query.edit_message_text(f"✅ Токен удалён. Осталось: {len(data['accounts'])}", reply_markup=back_button())
+    
+    elif query.data == "assign_proxies":
+        if not data['accounts']:
+            await query.edit_message_text("❌ Нет токенов. Сначала добавьте токены.", reply_markup=back_button())
+            return
+        if not data['proxies']:
+            await query.edit_message_text("❌ Нет прокси. Сначала добавьте прокси.", reply_markup=back_button())
+            return
+        
+        # Распределяем прокси по аккаунтам по кругу
+        for i, acc in enumerate(data['accounts']):
+            proxy = data['proxies'][i % len(data['proxies'])]
+            acc['proxy'] = proxy
+        
+        save_data(data)
+        await query.edit_message_text(
+            f"✅ <b>Прокси привязаны к токенам!</b>\n\n"
+            f"Всего токенов: {len(data['accounts'])}\n"
+            f"Всего прокси: {len(data['proxies'])}\n\n"
+            f"Каждому токену назначен прокси по кругу.",
+            parse_mode='HTML',
+            reply_markup=back_button()
+        )
+    
+    # ===== ПРОКСИ =====
+    elif query.data == "proxies_menu":
+        keyboard = [
+            [InlineKeyboardButton("➕ Добавить прокси", callback_data="add_proxies")],
+            [InlineKeyboardButton("📋 Список прокси", callback_data="list_proxies")],
+            [InlineKeyboardButton("🗑️ Удалить прокси", callback_data="delete_proxy")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]
+        ]
+        await query.edit_message_text(
+            f"🌐 <b>Управление прокси</b>\n\n"
+            f"Всего прокси: {len(data['proxies'])}\n\n"
+            "Прокси можно добавить списком, каждый с новой строки.\n"
+            "Формат: <code>http://user:pass@ip:port</code>",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    elif query.data == "add_proxies":
+        context.user_data['action'] = 'add_proxies'
+        await query.edit_message_text(
+            "🌐 <b>Введите прокси</b>\n\n"
+            "Каждый прокси с новой строки.\n"
+            "Формат: <code>http://user:pass@ip:port</code>\n\n"
+            "Пример:\n"
+            "<code>http://user1:pass1@192.168.1.1:8080\n"
+            "http://user2:pass2@192.168.1.2:8080</code>",
+            parse_mode='HTML',
+            reply_markup=back_button()
+        )
+    
+    elif query.data == "list_proxies":
+        if not data['proxies']:
+            await query.edit_message_text("❌ Нет прокси.", reply_markup=back_button())
+            return
+        text = ""
+        for i, proxy in enumerate(data['proxies']):
+            # Скрываем пароль для безопасности
+            clean_proxy = re.sub(r':[^:@]+@', ':****@', proxy)
+            text += f"{i+1}. <code>{clean_proxy}</code>\n"
+        await query.edit_message_text(f"📋 <b>Прокси</b>\n\n{text}", parse_mode='HTML', reply_markup=back_button())
+    
+    elif query.data == "delete_proxy":
+        if not data['proxies']:
+            await query.edit_message_text("❌ Нет прокси.", reply_markup=back_button())
+            return
+        keyboard = []
+        for i, proxy in enumerate(data['proxies']):
+            short = proxy[:30] + "..." if len(proxy) > 35 else proxy
+            keyboard.append([InlineKeyboardButton(f"🗑️ {short}", callback_data=f"del_proxy_{i}")])
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="proxies_menu")])
+        await query.edit_message_text("🗑️ Выберите прокси для удаления:", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif query.data.startswith("del_proxy_"):
+        idx = int(query.data.split("_")[2])
+        data['proxies'].pop(idx)
+        save_data(data)
+        await query.edit_message_text(f"✅ Прокси удалён. Осталось: {len(data['proxies'])}", reply_markup=back_button())
     
     # ===== ТЕКСТЫ =====
     elif query.data == "texts_menu":
@@ -285,9 +396,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "📤 <b>Загрузка CSV</b>\n\n"
             "Отправьте CSV-файл с объявлениями.\n\n"
-            "Формат:\n"
-            "<code>ad_id,title,price,city,description,url</code>\n\n"
-            "Где ad_id — ID объявления на OLX (для отправки сообщения)",
+            "Поддерживается ваш формат:\n"
+            "<code>country,title,price,publication,seller,registration,phone,ad_url,image_url,city,category,description</code>\n\n"
+            "Бот сам найдёт ID объявления в ссылке.",
             parse_mode='HTML',
             reply_markup=back_button()
         )
@@ -313,6 +424,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"🚀 <b>Начинаю рассылку...</b>\n\n"
             f"👤 Токенов: {len(data['accounts'])}\n"
+            f"🌐 Прокси: {len(data['proxies'])}\n"
             f"📦 Объявлений: {len(data['ads'])}\n"
             f"📝 Текстов: {len(data['texts'])}\n"
             f"⏱ Задержка: {data.get('delay', 5)} сек\n\n"
@@ -331,6 +443,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif query.data == "clear_all":
         data['accounts'] = []
+        data['proxies'] = []
         data['texts'] = []
         data['ads'] = []
         data['delay'] = 5
@@ -350,15 +463,20 @@ async def send_all_messages(context, chat_id) -> str:
     
     for i, ad in enumerate(ads, 1):
         try:
-            # Выбираем случайный токен
+            # Выбираем случайный аккаунт
             account = random.choice(accounts)
             access_token = account['access_token']
+            proxy = account.get('proxy')
             
             if not access_token:
-                errors.append(f"❌ Токен {account.get('name', 'без имени')}: пустой")
+                errors.append(f"❌ {account.get('name', 'без имени')}: пустой токен")
                 continue
             
-            # Выбираем случайный текст
+            ad_id = extract_ad_id_from_url(ad.get('url', ''))
+            if not ad_id:
+                errors.append(f"❌ {ad.get('title', 'Объявление')}: не удалось извлечь ID")
+                continue
+            
             text_template = random.choice(texts)
             message_text = text_template.format(
                 title=ad.get('title', 'Объявление'),
@@ -368,8 +486,7 @@ async def send_all_messages(context, chat_id) -> str:
                 url=ad.get('url', '#')
             )
             
-            # Отправляем сообщение
-            result = send_message_via_api(access_token, ad['ad_id'], message_text)
+            result = send_message_via_api(access_token, ad_id, message_text, proxy)
             
             if result.get('success'):
                 sent += 1
@@ -403,6 +520,43 @@ async def send_all_messages(context, chat_id) -> str:
     
     return report
 
+# ===== ПАРСИНГ CSV =====
+def parse_csv_text(content: str) -> list:
+    lines = content.strip().split('\n')
+    if len(lines) < 2:
+        return []
+    
+    header = lines[0].strip().split(',')
+    
+    try:
+        title_idx = header.index('title')
+        price_idx = header.index('price')
+        ad_url_idx = header.index('ad_url')
+        city_idx = header.index('city')
+        description_idx = header.index('description')
+    except ValueError:
+        return []
+    
+    ads = []
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        parts = line.split(',')
+        if len(parts) < max(title_idx, price_idx, ad_url_idx, city_idx, description_idx) + 1:
+            continue
+        
+        ad_url = parts[ad_url_idx] if ad_url_idx < len(parts) else ''
+        
+        ads.append({
+            'title': parts[title_idx] if title_idx < len(parts) else '',
+            'price': parts[price_idx] if price_idx < len(parts) else '',
+            'city': parts[city_idx] if city_idx < len(parts) else '',
+            'description': parts[description_idx] if description_idx < len(parts) else '',
+            'url': ad_url
+        })
+    
+    return ads
+
 # ===== ОБРАБОТЧИК СООБЩЕНИЙ =====
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data = context.user_data
@@ -415,35 +569,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     
     if action == 'add_account':
-        # Формат: Название|access_token
-        parts = text.split('|')
-        if len(parts) >= 2:
-            name = parts[0].strip()
-            token = parts[1].strip()
-            account = {
-                "name": name,
-                "access_token": token,
-                "refresh_token": "",
-                "expires_at": ""
-            }
-            data['accounts'].append(account)
-            save_data(data)
-            await update.message.reply_text(
-                f"✅ <b>Токен добавлен!</b>\n\n"
-                f"👤 {name}\n"
-                f"🔑 <code>{token[:20]}...{token[-10:]}</code>\n\n"
-                f"Всего токенов: <b>{len(data['accounts'])}</b>",
-                parse_mode='HTML',
-                reply_markup=main_menu()
-            )
-        else:
-            await update.message.reply_text(
-                "❌ Неправильный формат.\n\n"
-                "Используйте: <code>Название|access_token</code>\n"
-                "Пример: <code>Мой аккаунт|eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...</code>",
-                parse_mode='HTML',
-                reply_markup=back_button()
-            )
+        # Просто токен — имя получим автоматически
+        access_token = text
+        
+        # Получаем имя через API
+        name = get_account_name(access_token)
+        
+        account = {
+            "access_token": access_token,
+            "name": name,
+            "proxy": None
+        }
+        data['accounts'].append(account)
+        save_data(data)
+        
+        await update.message.reply_text(
+            f"✅ <b>Токен добавлен!</b>\n\n"
+            f"👤 Имя: <b>{name}</b>\n"
+            f"🔑 <code>{access_token[:20]}...{access_token[-10:]}</code>\n\n"
+            f"Всего токенов: <b>{len(data['accounts'])}</b>",
+            parse_mode='HTML',
+            reply_markup=main_menu()
+        )
+        user_data['action'] = None
+    
+    elif action == 'add_proxies':
+        proxies = [p.strip() for p in text.split('\n') if p.strip()]
+        data['proxies'].extend(proxies)
+        save_data(data)
+        await update.message.reply_text(
+            f"✅ Добавлено прокси: <b>{len(proxies)}</b>\n\nВсего: <b>{len(data['proxies'])}</b>",
+            parse_mode='HTML',
+            reply_markup=main_menu()
+        )
         user_data['action'] = None
     
     elif action == 'add_text':
@@ -472,7 +630,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=main_menu()
                 )
             else:
-                await update.message.reply_text("❌ Не удалось распарсить CSV.", reply_markup=back_button())
+                await update.message.reply_text(
+                    "❌ Не удалось распарсить CSV.\n"
+                    "Проверьте формат.",
+                    reply_markup=back_button()
+                )
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
         user_data['action'] = None
@@ -511,51 +673,20 @@ async def handle_csv_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=main_menu()
             )
         else:
-            await update.message.reply_text("❌ Не удалось распарсить CSV.", reply_markup=back_button())
+            await update.message.reply_text(
+                "❌ Не удалось распарсить CSV.\n"
+                "Проверьте формат.",
+                reply_markup=back_button()
+            )
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {str(e)}")
-
-def parse_csv_text(content: str) -> list:
-    """Парсит CSV в список объявлений"""
-    lines = content.strip().split('\n')
-    if len(lines) < 2:
-        return []
-    
-    header = lines[0].strip().split(',')
-    try:
-        ad_id_idx = header.index('ad_id')
-        title_idx = header.index('title')
-        price_idx = header.index('price') if 'price' in header else None
-        city_idx = header.index('city') if 'city' in header else None
-        description_idx = header.index('description') if 'description' in header else None
-        url_idx = header.index('url') if 'url' in header else None
-    except ValueError:
-        # Если нет заголовков — по порядку
-        return []
-    
-    ads = []
-    for line in lines[1:]:
-        if not line.strip():
-            continue
-        parts = line.split(',')
-        ad = {
-            'ad_id': parts[ad_id_idx] if ad_id_idx < len(parts) else '',
-            'title': parts[title_idx] if title_idx < len(parts) else '',
-            'price': parts[price_idx] if price_idx is not None and price_idx < len(parts) else '',
-            'city': parts[city_idx] if city_idx is not None and city_idx < len(parts) else '',
-            'description': parts[description_idx] if description_idx is not None and description_idx < len(parts) else '',
-            'url': parts[url_idx] if url_idx is not None and url_idx < len(parts) else ''
-        }
-        if ad['ad_id']:
-            ads.append(ad)
-    return ads
 
 # ===== ЗАПУСК =====
 def main():
     BOT_TOKEN = os.getenv("BOT_TOKEN")
     
     if not BOT_TOKEN:
-        print("❌ Ошибка: BOT_TOKEN не найден в переменных окружения!")
+        print("❌ Ошибка: BOT_TOKEN не найден!")
         return
     
     app = Application.builder().token(BOT_TOKEN).build()
@@ -569,5 +700,5 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
-    import random
+    random.seed()
     main()
