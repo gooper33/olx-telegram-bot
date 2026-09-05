@@ -8,6 +8,7 @@ from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 import random
+import traceback
 
 # ===== ФАЙЛЫ ДЛЯ ХРАНЕНИЯ ДАННЫХ =====
 DATA_FILE = "data.json"
@@ -29,7 +30,6 @@ def save_data(data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 data = load_data()
-pending_csv = None  # временное хранение CSV перед загрузкой
 
 # ===== КЛАВИАТУРЫ =====
 def main_menu():
@@ -60,7 +60,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
     
     if query.data == "main_menu":
         await query.edit_message_text(
@@ -86,7 +85,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_button()
         )
     
-    # ===== ТОКЕНЫ =====
     elif query.data == "tokens_menu":
         keyboard = [
             [InlineKeyboardButton("➕ Добавить токен", callback_data="add_token")],
@@ -96,8 +94,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         await query.edit_message_text(
             f"🔑 <b>Управление токенами</b>\n\n"
-            f"Всего токенов: <b>{len(data['tokens'])}</b>\n\n"
-            f"Токены нужны для отправки сообщений. Каждый токен = один аккаунт.",
+            f"Всего токенов: <b>{len(data['tokens'])}</b>",
             parse_mode='HTML',
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -115,34 +112,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif query.data == "list_tokens":
         if not data['tokens']:
-            await query.edit_message_text(
-                "❌ Токены не добавлены.",
-                reply_markup=back_button()
-            )
+            await query.edit_message_text("❌ Токены не добавлены.", reply_markup=back_button())
             return
-        
         tokens_list = "\n".join([f"{i+1}. <code>{t[:15]}...{t[-5:]}</code>" for i, t in enumerate(data['tokens'])])
         await query.edit_message_text(
-            f"📋 <b>Список токенов</b>\n\n{tokens_list}\n\n"
-            f"Всего: <b>{len(data['tokens'])}</b>",
+            f"📋 <b>Список токенов</b>\n\n{tokens_list}\n\nВсего: <b>{len(data['tokens'])}</b>",
             parse_mode='HTML',
             reply_markup=back_button()
         )
     
     elif query.data == "delete_token":
         if not data['tokens']:
-            await query.edit_message_text(
-                "❌ Нет токенов для удаления.",
-                reply_markup=back_button()
-            )
+            await query.edit_message_text("❌ Нет токенов для удаления.", reply_markup=back_button())
             return
-        
         keyboard = []
         for i, token in enumerate(data['tokens']):
             short = f"{token[:10]}...{token[-5:]}" if len(token) > 15 else token
             keyboard.append([InlineKeyboardButton(f"🗑️ {short}", callback_data=f"del_token_{i}")])
         keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="tokens_menu")])
-        
         await query.edit_message_text(
             "🗑️ <b>Выберите токен для удаления</b>",
             parse_mode='HTML',
@@ -151,7 +138,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif query.data.startswith("del_token_"):
         index = int(query.data.split("_")[2])
-        deleted = data['tokens'].pop(index)
+        data['tokens'].pop(index)
         save_data(data)
         await query.edit_message_text(
             f"✅ Токен удалён.\n\nОсталось: <b>{len(data['tokens'])}</b>",
@@ -159,7 +146,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_button()
         )
     
-    # ===== ПРОКСИ =====
     elif query.data == "proxies_menu":
         keyboard = [
             [InlineKeyboardButton("➕ Добавить прокси", callback_data="add_proxy")],
@@ -168,9 +154,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]
         ]
         await query.edit_message_text(
-            f"🌐 <b>Управление прокси</b>\n\n"
-            f"Всего прокси: <b>{len(data['proxies'])}</b>\n\n"
-            f"Формат: <code>http://user:pass@ip:port</code>",
+            f"🌐 <b>Управление прокси</b>\n\nВсего прокси: <b>{len(data['proxies'])}</b>",
             parse_mode='HTML',
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -179,43 +163,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['action'] = 'add_proxy'
         await query.edit_message_text(
             "🌐 <b>Добавление прокси</b>\n\n"
-            "Отправьте прокси в формате:\n"
-            "<code>http://user:pass@ip:port</code>\n\n"
-            "Или несколько прокси, каждый с новой строки.",
+            "Отправьте прокси в формате:\n<code>http://user:pass@ip:port</code>",
             parse_mode='HTML',
             reply_markup=back_button()
         )
     
     elif query.data == "list_proxies":
         if not data['proxies']:
-            await query.edit_message_text(
-                "❌ Прокси не добавлены.",
-                reply_markup=back_button()
-            )
+            await query.edit_message_text("❌ Прокси не добавлены.", reply_markup=back_button())
             return
-        
         proxies_list = "\n".join([f"{i+1}. <code>{p}</code>" for i, p in enumerate(data['proxies'])])
         await query.edit_message_text(
-            f"📋 <b>Список прокси</b>\n\n{proxies_list}\n\n"
-            f"Всего: <b>{len(data['proxies'])}</b>",
+            f"📋 <b>Список прокси</b>\n\n{proxies_list}\n\nВсего: <b>{len(data['proxies'])}</b>",
             parse_mode='HTML',
             reply_markup=back_button()
         )
     
     elif query.data == "delete_proxy":
         if not data['proxies']:
-            await query.edit_message_text(
-                "❌ Нет прокси для удаления.",
-                reply_markup=back_button()
-            )
+            await query.edit_message_text("❌ Нет прокси для удаления.", reply_markup=back_button())
             return
-        
         keyboard = []
         for i, proxy in enumerate(data['proxies']):
             short = f"{proxy[:20]}..." if len(proxy) > 25 else proxy
             keyboard.append([InlineKeyboardButton(f"🗑️ {short}", callback_data=f"del_proxy_{i}")])
         keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="proxies_menu")])
-        
         await query.edit_message_text(
             "🗑️ <b>Выберите прокси для удаления</b>",
             parse_mode='HTML',
@@ -224,7 +196,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif query.data.startswith("del_proxy_"):
         index = int(query.data.split("_")[2])
-        deleted = data['proxies'].pop(index)
+        data['proxies'].pop(index)
         save_data(data)
         await query.edit_message_text(
             f"✅ Прокси удалён.\n\nОсталось: <b>{len(data['proxies'])}</b>",
@@ -232,7 +204,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_button()
         )
     
-    # ===== ТЕКСТЫ =====
     elif query.data == "texts_menu":
         keyboard = [
             [InlineKeyboardButton("➕ Добавить текст", callback_data="add_text")],
@@ -241,9 +212,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]
         ]
         await query.edit_message_text(
-            f"📝 <b>Управление текстами</b>\n\n"
-            f"Всего текстов: <b>{len(data['texts'])}</b>\n\n"
-            f"Тексты будут подставляться случайным образом к каждому объявлению.",
+            f"📝 <b>Управление текстами</b>\n\nВсего текстов: <b>{len(data['texts'])}</b>",
             parse_mode='HTML',
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -253,48 +222,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "📝 <b>Добавление текста</b>\n\n"
             "Отправьте текст для рассылки.\n"
-            "Можно использовать переменные:\n"
-            "<code>{title}</code> - название\n"
-            "<code>{price}</code> - цена\n"
-            "<code>{city}</code> - город\n"
-            "<code>{seller}</code> - продавец\n"
-            "<code>{description}</code> - описание\n"
-            "<code>{url}</code> - ссылка\n\n"
-            "Или отправьте несколько текстов, каждый с новой строки (разделитель ---)",
+            "Переменные:\n<code>{title}</code> - название\n<code>{price}</code> - цена\n<code>{city}</code> - город\n<code>{url}</code> - ссылка",
             parse_mode='HTML',
             reply_markup=back_button()
         )
     
     elif query.data == "list_texts":
         if not data['texts']:
-            await query.edit_message_text(
-                "❌ Тексты не добавлены.",
-                reply_markup=back_button()
-            )
+            await query.edit_message_text("❌ Тексты не добавлены.", reply_markup=back_button())
             return
-        
         texts_list = "\n\n---\n\n".join([f"{i+1}. {t[:100]}..." if len(t) > 100 else f"{i+1}. {t}" for i, t in enumerate(data['texts'])])
         await query.edit_message_text(
-            f"📋 <b>Список текстов</b>\n\n{texts_list}\n\n"
-            f"Всего: <b>{len(data['texts'])}</b>",
+            f"📋 <b>Список текстов</b>\n\n{texts_list}\n\nВсего: <b>{len(data['texts'])}</b>",
             parse_mode='HTML',
             reply_markup=back_button()
         )
     
     elif query.data == "delete_text":
         if not data['texts']:
-            await query.edit_message_text(
-                "❌ Нет текстов для удаления.",
-                reply_markup=back_button()
-            )
+            await query.edit_message_text("❌ Нет текстов для удаления.", reply_markup=back_button())
             return
-        
         keyboard = []
         for i, text in enumerate(data['texts']):
             short = f"{text[:20]}..." if len(text) > 25 else text
             keyboard.append([InlineKeyboardButton(f"🗑️ {short}", callback_data=f"del_text_{i}")])
         keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="texts_menu")])
-        
         await query.edit_message_text(
             "🗑️ <b>Выберите текст для удаления</b>",
             parse_mode='HTML',
@@ -303,7 +255,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif query.data.startswith("del_text_"):
         index = int(query.data.split("_")[2])
-        deleted = data['texts'].pop(index)
+        data['texts'].pop(index)
         save_data(data)
         await query.edit_message_text(
             f"✅ Текст удалён.\n\nОсталось: <b>{len(data['texts'])}</b>",
@@ -311,26 +263,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_button()
         )
     
-    # ===== CSV =====
     elif query.data == "upload_csv":
         context.user_data['action'] = 'upload_csv'
         await query.edit_message_text(
             "📤 <b>Загрузка CSV</b>\n\n"
             "Отправьте мне CSV-файл с объявлениями.\n\n"
-            "Формат:\n"
-            "<code>country,title,price,publication,seller,registration,phone,ad_url,image_url,city,category,description</code>",
+            "Формат: country,title,price,publication,seller,registration,phone,ad_url,image_url,city,category,description",
             parse_mode='HTML',
             reply_markup=back_button()
         )
     
-    # ===== РАССЫЛКА =====
     elif query.data == "start_send":
-        await query.edit_message_text(
-            "🚀 <b>Подготовка к рассылке...</b>",
-            parse_mode='HTML'
-        )
+        await query.edit_message_text("🚀 <b>Подготовка к рассылке...</b>", parse_mode='HTML')
         
-        # Проверка данных
         errors = []
         if not data['tokens']:
             errors.append("❌ Нет токенов")
@@ -347,7 +292,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         
-        # Запускаем рассылку
         await query.edit_message_text(
             f"🚀 <b>Начинаю рассылку...</b>\n\n"
             f"📦 Объявлений: {len(data['ads'])}\n"
@@ -358,12 +302,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML'
         )
         
-        # Здесь запускается рассылка
-        sent = await send_all_ads(context, query.from_user.id)
+        # ЗАПУСК РАССЫЛКИ
+        result = await send_all_ads(context, query.from_user.id)
         
+        # ОТПРАВКА СТАТИСТИКИ ПОСЛЕ РАССЫЛКИ
         await context.bot.send_message(
             chat_id=query.from_user.id,
-            text=f"✅ <b>Рассылка завершена!</b>\n\nОтправлено: <b>{sent}</b>",
+            text=result,
             parse_mode='HTML',
             reply_markup=main_menu()
         )
@@ -380,55 +325,101 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_menu()
         )
 
-# ===== ФУНКЦИЯ РАССЫЛКИ =====
-async def send_all_ads(context, chat_id):
-    """Рассылка объявлений с случайными текстами и ротацией токенов/прокси"""
-    sent = 0
+# ===== ФУНКЦИЯ РАССЫЛКИ С ОБРАБОТКОЙ ОШИБОК =====
+async def send_all_ads(context, chat_id) -> str:
+    """Рассылка объявлений с подсчётом и обработкой ошибок"""
     ads = data['ads']
     texts = data['texts']
     tokens = data['tokens']
     proxies = data['proxies']
     
+    total = len(ads)
+    sent = 0
+    errors = []
+    banned_tokens = []
+    
     for i, ad in enumerate(ads, 1):
-        # Выбираем случайный текст
-        text_template = random.choice(texts)
-        
-        # Подставляем переменные
-        message_text = text_template.format(
-            title=ad.get('title', 'Без названия'),
-            price=ad.get('price', 'Цена не указана'),
-            city=ad.get('city', 'Не указано'),
-            seller=ad.get('seller', 'Продавец'),
-            description=ad.get('description', '')[:300],
-            url=ad.get('ad_url', '#')
-        )
-        
-        # Выбираем токен и прокси (если есть)
-        token = random.choice(tokens)
-        proxy = random.choice(proxies) if proxies else None
-        
-        # Формируем сообщение с фото
         try:
+            # Выбираем случайный текст
+            text_template = random.choice(texts)
+            
+            # Подставляем переменные
+            message_text = text_template.format(
+                title=ad.get('title', 'Без названия'),
+                price=ad.get('price', 'Цена не указана'),
+                city=ad.get('city', 'Не указано'),
+                seller=ad.get('seller', 'Продавец'),
+                description=ad.get('description', '')[:300],
+                url=ad.get('ad_url', '#')
+            )
+            
+            # Выбираем токен (с ротацией)
+            token = tokens[i % len(tokens)]
+            
+            # Создаём отдельный бот для каждого токена
+            from telegram import Bot
+            bot = Bot(token=token)
+            
+            # Если есть прокси
+            if proxies:
+                proxy = proxies[i % len(proxies)]
+                # Устанавливаем прокси для бота (через aiohttp)
+                from telegram.request import HTTPXRequest
+                request = HTTPXRequest(proxy=proxy)
+                bot = Bot(token=token, request=request)
+            
+            # Отправляем
             if ad.get('image_url') and ad['image_url'].startswith('http'):
-                await context.bot.send_photo(
+                await bot.send_photo(
                     chat_id=chat_id,
                     photo=ad['image_url'],
                     caption=message_text,
                     parse_mode='HTML'
                 )
             else:
-                await context.bot.send_message(
+                await bot.send_message(
                     chat_id=chat_id,
                     text=message_text,
                     parse_mode='HTML'
                 )
+            
             sent += 1
             await asyncio.sleep(1)  # задержка
+            
         except Exception as e:
-            print(f"Ошибка: {e}")
-            continue
+            error_msg = str(e)
+            # Проверяем бан
+            if "Unauthorized" in error_msg or "Invalid token" in error_msg or "Forbidden" in error_msg:
+                banned_tokens.append(token)
+                errors.append(f"❌ Токен {token[:10]}... забанен: {error_msg[:100]}")
+            else:
+                errors.append(f"⚠️ Ошибка в объявлении {i}: {error_msg[:100]}")
+            
+            # Если забанили все токены - останавливаем
+            if len(banned_tokens) == len(tokens):
+                break
     
-    return sent
+    # Формируем отчёт
+    report = f"✅ <b>Рассылка завершена!</b>\n\n"
+    report += f"📦 <b>Статистика:</b>\n"
+    report += f"Всего объявлений: <b>{total}</b>\n"
+    report += f"Отправлено успешно: <b>{sent}</b>\n"
+    report += f"Ошибок: <b>{len(errors)}</b>\n\n"
+    
+    if banned_tokens:
+        report += f"🚫 <b>Забаненные токены:</b>\n"
+        for t in banned_tokens:
+            report += f"- <code>{t[:15]}...{t[-5:]}</code>\n"
+        report += f"\n💡 Удалите их через меню и добавьте новые.\n\n"
+    
+    if errors:
+        report += f"📋 <b>Последние ошибки:</b>\n"
+        for err in errors[:5]:
+            report += f"{err}\n"
+        if len(errors) > 5:
+            report += f"... и ещё {len(errors) - 5} ошибок\n"
+    
+    return report
 
 # ===== ОБРАБОТЧИК СООБЩЕНИЙ =====
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -442,13 +433,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     
     if action == 'add_token':
-        # Разбиваем на несколько токенов
         new_tokens = [t.strip() for t in text.split('\n') if t.strip()]
         data['tokens'].extend(new_tokens)
         save_data(data)
         await update.message.reply_text(
-            f"✅ Добавлено токенов: <b>{len(new_tokens)}</b>\n\n"
-            f"Всего токенов: <b>{len(data['tokens'])}</b>",
+            f"✅ Добавлено токенов: <b>{len(new_tokens)}</b>\n\nВсего: <b>{len(data['tokens'])}</b>",
             parse_mode='HTML',
             reply_markup=main_menu()
         )
@@ -459,55 +448,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data['proxies'].extend(new_proxies)
         save_data(data)
         await update.message.reply_text(
-            f"✅ Добавлено прокси: <b>{len(new_proxies)}</b>\n\n"
-            f"Всего прокси: <b>{len(data['proxies'])}</b>",
+            f"✅ Добавлено прокси: <b>{len(new_proxies)}</b>\n\nВсего: <b>{len(data['proxies'])}</b>",
             parse_mode='HTML',
             reply_markup=main_menu()
         )
         user_data['action'] = None
     
     elif action == 'add_text':
-        # Разбиваем через разделитель ---
         if '---' in text:
             new_texts = [t.strip() for t in text.split('---') if t.strip()]
         else:
             new_texts = [text.strip()]
-        
         data['texts'].extend(new_texts)
         save_data(data)
         await update.message.reply_text(
-            f"✅ Добавлено текстов: <b>{len(new_texts)}</b>\n\n"
-            f"Всего текстов: <b>{len(data['texts'])}</b>",
+            f"✅ Добавлено текстов: <b>{len(new_texts)}</b>\n\nВсего: <b>{len(data['texts'])}</b>",
             parse_mode='HTML',
             reply_markup=main_menu()
         )
         user_data['action'] = None
     
     elif action == 'upload_csv':
-        # Обработка CSV (если прислали текстом)
         try:
             ads = parse_csv_text(text)
             if ads:
                 data['ads'] = ads
                 save_data(data)
                 await update.message.reply_text(
-                    f"✅ Загружено объявлений: <b>{len(ads)}</b>\n\n"
-                    f"Первое: {ads[0]['title']}\n"
-                    f"Цена: {ads[0]['price']}",
+                    f"✅ Загружено объявлений: <b>{len(ads)}</b>",
                     parse_mode='HTML',
                     reply_markup=main_menu()
                 )
             else:
-                await update.message.reply_text(
-                    "❌ Не удалось распарсить CSV. Проверьте формат.",
-                    reply_markup=back_button()
-                )
+                await update.message.reply_text("❌ Не удалось распарсить CSV.", reply_markup=back_button())
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
         user_data['action'] = None
 
 async def handle_csv_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик загруженного CSV-файла"""
     document = update.message.document
     if not document.file_name.endswith('.csv'):
         await update.message.reply_text("⚠️ Отправьте файл в формате CSV.")
@@ -519,16 +497,11 @@ async def handle_csv_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         text = content.decode('utf-8')
         ads = parse_csv_text(text)
-        
         if ads:
             data['ads'] = ads
             save_data(data)
             await update.message.reply_text(
-                f"✅ <b>CSV загружен!</b>\n\n"
-                f"Объявлений: <b>{len(ads)}</b>\n\n"
-                f"Первое: {ads[0]['title']}\n"
-                f"💰 {ads[0]['price']}\n"
-                f"📍 {ads[0]['city']}",
+                f"✅ <b>CSV загружен!</b>\n\nОбъявлений: <b>{len(ads)}</b>",
                 parse_mode='HTML',
                 reply_markup=main_menu()
             )
@@ -575,7 +548,15 @@ def parse_csv_text(content: str) -> list:
 
 # ===== ЗАПУСК =====
 def main():
-    app = Application.builder().token("ВАШ_ТОКЕН_ОТ_BOTFATHER").build()
+    # ТОКЕН БЕРЕТСЯ ИЗ ПЕРЕМЕННОЙ ОКРУЖЕНИЯ
+    BOT_TOKEN = os.getenv("BOT_TOKEN")
+    
+    if not BOT_TOKEN:
+        print("❌ Ошибка: BOT_TOKEN не найден в переменных окружения!")
+        print("Добавьте переменную BOT_TOKEN в Render (Environment → Environment Variables)")
+        return
+    
+    app = Application.builder().token(BOT_TOKEN).build()
     
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
