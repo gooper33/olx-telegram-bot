@@ -1,2 +1,2 @@
-drissionpage 
 python-telegram-bot
+requests

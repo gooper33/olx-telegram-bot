@@ -2,14 +2,15 @@ import os
 import csv
 import json
 import asyncio
-import re
 import random
-from datetime import datetime
+import requests
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
 # ===== ФАЙЛ ДЛЯ ХРАНЕНИЯ ДАННЫХ =====
 DATA_FILE = "data.json"
+COUNTRY_CODE = "ro"
 
 # ===== ЗАГРУЗКА/СОХРАНЕНИЕ ДАННЫХ =====
 def load_data():
@@ -17,11 +18,10 @@ def load_data():
         with open(DATA_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
     return {
-        "tokens": [],
-        "proxies": [],
+        "accounts": [],  # [{"name": "Аккаунт 1", "access_token": "...", "refresh_token": "...", "expires_at": "..."}]
         "texts": [],
         "ads": [],
-        "delay": 5  # задержка по умолчанию 5 секунд
+        "delay": 5
     }
 
 def save_data(data):
@@ -34,10 +34,9 @@ data = load_data()
 def main_menu():
     keyboard = [
         [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
-        [InlineKeyboardButton("🔑 Управление токенами", callback_data="tokens_menu")],
-        [InlineKeyboardButton("🌐 Управление прокси", callback_data="proxies_menu")],
+        [InlineKeyboardButton("👤 Управление токенами", callback_data="accounts_menu")],
         [InlineKeyboardButton("📝 Управление текстами", callback_data="texts_menu")],
-        [InlineKeyboardButton("⏱ Настройка задержки", callback_data="delay_menu")],
+        [InlineKeyboardButton("⏱ Задержка", callback_data="delay_menu")],
         [InlineKeyboardButton("📤 Загрузить CSV", callback_data="upload_csv")],
         [InlineKeyboardButton("🚀 Начать рассылку", callback_data="start_send")],
         [InlineKeyboardButton("🔄 Очистить всё", callback_data="clear_all")]
@@ -47,12 +46,84 @@ def main_menu():
 def back_button():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]])
 
-# ===== ОБРАБОТЧИКИ =====
+# ===== ФУНКЦИИ ОТПРАВКИ ЧЕРЕЗ OLX API =====
+def get_valid_token(account):
+    """Проверяет токен и обновляет если нужно"""
+    if not account.get('expires_at'):
+        return account.get('access_token')
+    
+    try:
+        expires_at = datetime.fromisoformat(account['expires_at'])
+        if datetime.now() >= expires_at:
+            # Обновляем токен
+            response = requests.post(
+                "https://www.olx.ro/api/open/oauth/token",
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": account['refresh_token'],
+                    "client_id": account.get('client_id', ''),
+                    "client_secret": account.get('client_secret', '')
+                }
+            )
+            if response.status_code == 200:
+                result = response.json()
+                account['access_token'] = result.get('access_token')
+                account['refresh_token'] = result.get('refresh_token', account['refresh_token'])
+                account['expires_at'] = (datetime.now() + timedelta(seconds=result.get('expires_in', 3600))).isoformat()
+                save_data(data)
+                return account['access_token']
+        return account['access_token']
+    except:
+        return account.get('access_token')
+
+def send_message_via_api(access_token, ad_id, message_text):
+    """Отправляет сообщение в чат объявления"""
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    
+    try:
+        # Пробуем отправить сообщение напрямую
+        response = requests.post(
+            f"https://www.olx.ro/api/partner/ads/{ad_id}/threads",
+            headers=headers,
+            json={"message": {"text": message_text}}
+        )
+        if response.status_code == 201:
+            return {"success": True}
+        elif response.status_code == 409:
+            # Чат уже существует — ищем его
+            threads = requests.get(
+                f"https://www.olx.ro/api/partner/ads/{ad_id}/threads",
+                headers=headers
+            )
+            if threads.status_code == 200:
+                thread_data = threads.json()
+                if thread_data.get('data') and len(thread_data['data']) > 0:
+                    thread_id = thread_data['data'][0].get('id')
+                    if thread_id:
+                        msg_response = requests.post(
+                            f"https://www.olx.ro/api/partner/threads/{thread_id}/messages",
+                            headers=headers,
+                            json={"text": message_text}
+                        )
+                        if msg_response.status_code == 201:
+                            return {"success": True}
+        return {"error": f"Ошибка {response.status_code}: {response.text[:200]}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+# ===== ОБРАБОТЧИКИ КОМАНД =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 <b>OLX Рассыльщик</b>\n\n"
-        "📌 Управляйте рассылкой через меню.\n"
-        "Добавьте токены, прокси, тексты и загрузите CSV с объявлениями.",
+        "📌 Бот рассылает сообщения в чаты OLX\n\n"
+        "1️⃣ Добавьте access_token аккаунтов OLX\n"
+        "2️⃣ Загрузите CSV с ID объявлений\n"
+        "3️⃣ Добавьте тексты\n"
+        "4️⃣ Начните рассылку",
         parse_mode='HTML',
         reply_markup=main_menu()
     )
@@ -67,8 +138,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "stats":
         await query.edit_message_text(
             f"📊 <b>Статистика</b>\n\n"
-            f"🔑 Токенов: <b>{len(data['tokens'])}</b>\n"
-            f"🌐 Прокси: <b>{len(data['proxies'])}</b>\n"
+            f"👤 Токенов: <b>{len(data['accounts'])}</b>\n"
             f"📝 Текстов: <b>{len(data['texts'])}</b>\n"
             f"📦 Объявлений: <b>{len(data['ads'])}</b>\n"
             f"⏱ Задержка: <b>{data.get('delay', 5)} сек</b>",
@@ -76,131 +146,60 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_button()
         )
     
-    # ===== ЗАДЕРЖКА =====
-    elif query.data == "delay_menu":
-        keyboard = [
-            [InlineKeyboardButton("1 сек", callback_data="delay_1")],
-            [InlineKeyboardButton("3 сек", callback_data="delay_3")],
-            [InlineKeyboardButton("5 сек", callback_data="delay_5")],
-            [InlineKeyboardButton("10 сек", callback_data="delay_10")],
-            [InlineKeyboardButton("15 сек", callback_data="delay_15")],
-            [InlineKeyboardButton("30 сек", callback_data="delay_30")],
-            [InlineKeyboardButton("60 сек", callback_data="delay_60")],
-            [InlineKeyboardButton("✏️ Своё значение", callback_data="delay_custom")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]
-        ]
-        current_delay = data.get('delay', 5)
-        await query.edit_message_text(
-            f"⏱ <b>Настройка задержки</b>\n\n"
-            f"Текущая задержка: <b>{current_delay} сек</b>\n\n"
-            f"Выберите задержку между отправками:",
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    
-    elif query.data.startswith("delay_"):
-        if query.data == "delay_custom":
-            context.user_data['action'] = 'set_delay'
-            await query.edit_message_text(
-                "✏️ <b>Введите задержку в секундах</b>\n\n"
-                "Например: <code>10</code> (будет 10 секунд между отправками)",
-                parse_mode='HTML',
-                reply_markup=back_button()
-            )
-        else:
-            seconds = int(query.data.split("_")[1])
-            data['delay'] = seconds
-            save_data(data)
-            await query.edit_message_text(
-                f"✅ Задержка установлена: <b>{seconds} сек</b>",
-                parse_mode='HTML',
-                reply_markup=main_menu()
-            )
-    
     # ===== ТОКЕНЫ =====
-    elif query.data == "tokens_menu":
+    elif query.data == "accounts_menu":
         keyboard = [
-            [InlineKeyboardButton("➕ Добавить токен", callback_data="add_token")],
-            [InlineKeyboardButton("📋 Список токенов", callback_data="list_tokens")],
-            [InlineKeyboardButton("🗑️ Удалить токен", callback_data="delete_token")],
+            [InlineKeyboardButton("➕ Добавить токен", callback_data="add_account")],
+            [InlineKeyboardButton("📋 Список токенов", callback_data="list_accounts")],
+            [InlineKeyboardButton("🗑️ Удалить токен", callback_data="delete_account")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]
         ]
         await query.edit_message_text(
-            f"🔑 <b>Управление токенами</b>\n\nВсего: {len(data['tokens'])}",
+            f"👤 <b>Управление токенами</b>\n\n"
+            f"Всего: {len(data['accounts'])}\n\n"
+            "Введите access_token аккаунта OLX в формате:\n"
+            "<code>Название|access_token</code>\n\n"
+            "Пример: <code>Мой аккаунт|abc123xyz456</code>",
             parse_mode='HTML',
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
     
-    elif query.data == "add_token":
-        context.user_data['action'] = 'add_token'
+    elif query.data == "add_account":
+        context.user_data['action'] = 'add_account'
         await query.edit_message_text(
-            "🔑 Отправьте токен от @BotFather.\n\nМожно несколько, каждый с новой строки.",
+            "✏️ <b>Введите токен</b>\n\n"
+            "Формат: <code>Название|access_token</code>\n\n"
+            "Пример: <code>Аккаунт 1|eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...</code>",
+            parse_mode='HTML',
             reply_markup=back_button()
         )
     
-    elif query.data == "list_tokens":
-        if not data['tokens']:
+    elif query.data == "list_accounts":
+        if not data['accounts']:
             await query.edit_message_text("❌ Нет токенов.", reply_markup=back_button())
             return
-        text = "\n".join([f"{i+1}. <code>{t[:15]}...{t[-5:]}</code>" for i, t in enumerate(data['tokens'])])
+        text = ""
+        for i, acc in enumerate(data['accounts']):
+            token_short = acc['access_token'][:15] + "..." if len(acc['access_token']) > 20 else acc['access_token']
+            text += f"{i+1}. {acc.get('name', 'Без имени')}\n   <code>{token_short}</code>\n"
         await query.edit_message_text(f"📋 <b>Токены</b>\n\n{text}", parse_mode='HTML', reply_markup=back_button())
     
-    elif query.data == "delete_token":
-        if not data['tokens']:
+    elif query.data == "delete_account":
+        if not data['accounts']:
             await query.edit_message_text("❌ Нет токенов.", reply_markup=back_button())
             return
-        keyboard = [[InlineKeyboardButton(f"🗑️ {t[:15]}...", callback_data=f"del_token_{i}")] for i, t in enumerate(data['tokens'])]
-        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="tokens_menu")])
+        keyboard = []
+        for i, acc in enumerate(data['accounts']):
+            name = acc.get('name', f'Токен {i+1}')
+            keyboard.append([InlineKeyboardButton(f"🗑️ {name}", callback_data=f"del_acc_{i}")])
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="accounts_menu")])
         await query.edit_message_text("🗑️ Выберите токен для удаления:", reply_markup=InlineKeyboardMarkup(keyboard))
     
-    elif query.data.startswith("del_token_"):
+    elif query.data.startswith("del_acc_"):
         idx = int(query.data.split("_")[2])
-        data['tokens'].pop(idx)
+        data['accounts'].pop(idx)
         save_data(data)
-        await query.edit_message_text(f"✅ Удалено. Осталось: {len(data['tokens'])}", reply_markup=back_button())
-    
-    # ===== ПРОКСИ =====
-    elif query.data == "proxies_menu":
-        keyboard = [
-            [InlineKeyboardButton("➕ Добавить прокси", callback_data="add_proxy")],
-            [InlineKeyboardButton("📋 Список прокси", callback_data="list_proxies")],
-            [InlineKeyboardButton("🗑️ Удалить прокси", callback_data="delete_proxy")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]
-        ]
-        await query.edit_message_text(
-            f"🌐 <b>Управление прокси</b>\n\nВсего: {len(data['proxies'])}",
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    
-    elif query.data == "add_proxy":
-        context.user_data['action'] = 'add_proxy'
-        await query.edit_message_text(
-            "🌐 Отправьте прокси в формате:\n<code>http://user:pass@ip:port</code>",
-            parse_mode='HTML',
-            reply_markup=back_button()
-        )
-    
-    elif query.data == "list_proxies":
-        if not data['proxies']:
-            await query.edit_message_text("❌ Нет прокси.", reply_markup=back_button())
-            return
-        text = "\n".join([f"{i+1}. <code>{p}</code>" for i, p in enumerate(data['proxies'])])
-        await query.edit_message_text(f"📋 <b>Прокси</b>\n\n{text}", parse_mode='HTML', reply_markup=back_button())
-    
-    elif query.data == "delete_proxy":
-        if not data['proxies']:
-            await query.edit_message_text("❌ Нет прокси.", reply_markup=back_button())
-            return
-        keyboard = [[InlineKeyboardButton(f"🗑️ {p[:20]}...", callback_data=f"del_proxy_{i}")] for i, p in enumerate(data['proxies'])]
-        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="proxies_menu")])
-        await query.edit_message_text("🗑️ Выберите прокси для удаления:", reply_markup=InlineKeyboardMarkup(keyboard))
-    
-    elif query.data.startswith("del_proxy_"):
-        idx = int(query.data.split("_")[2])
-        data['proxies'].pop(idx)
-        save_data(data)
-        await query.edit_message_text(f"✅ Удалено. Осталось: {len(data['proxies'])}", reply_markup=back_button())
+        await query.edit_message_text(f"✅ Токен удалён. Осталось: {len(data['accounts'])}", reply_markup=back_button())
     
     # ===== ТЕКСТЫ =====
     elif query.data == "texts_menu":
@@ -224,6 +223,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "<code>{title}</code> - название\n"
             "<code>{price}</code> - цена\n"
             "<code>{city}</code> - город\n"
+            "<code>{description}</code> - описание\n"
             "<code>{url}</code> - ссылка\n\n"
             "Можно несколько, разделяя <code>---</code>",
             parse_mode='HTML',
@@ -249,31 +249,58 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         idx = int(query.data.split("_")[2])
         data['texts'].pop(idx)
         save_data(data)
-        await query.edit_message_text(f"✅ Удалено. Осталось: {len(data['texts'])}", reply_markup=back_button())
+        await query.edit_message_text(f"✅ Текст удалён. Осталось: {len(data['texts'])}", reply_markup=back_button())
+    
+    # ===== ЗАДЕРЖКА =====
+    elif query.data == "delay_menu":
+        keyboard = [
+            [InlineKeyboardButton("1 сек", callback_data="delay_1")],
+            [InlineKeyboardButton("3 сек", callback_data="delay_3")],
+            [InlineKeyboardButton("5 сек", callback_data="delay_5")],
+            [InlineKeyboardButton("10 сек", callback_data="delay_10")],
+            [InlineKeyboardButton("15 сек", callback_data="delay_15")],
+            [InlineKeyboardButton("30 сек", callback_data="delay_30")],
+            [InlineKeyboardButton("✏️ Своё", callback_data="delay_custom")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]
+        ]
+        await query.edit_message_text(
+            f"⏱ <b>Задержка между сообщениями</b>\n\nТекущая: {data.get('delay', 5)} сек",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    elif query.data.startswith("delay_"):
+        if query.data == "delay_custom":
+            context.user_data['action'] = 'set_delay'
+            await query.edit_message_text("✏️ Введите задержку в секундах:", reply_markup=back_button())
+        else:
+            seconds = int(query.data.split("_")[1])
+            data['delay'] = seconds
+            save_data(data)
+            await query.edit_message_text(f"✅ Задержка: {seconds} сек", reply_markup=main_menu())
     
     # ===== CSV =====
     elif query.data == "upload_csv":
         context.user_data['action'] = 'upload_csv'
         await query.edit_message_text(
             "📤 <b>Загрузка CSV</b>\n\n"
-            "Отправьте мне CSV-файл с объявлениями.\n\n"
+            "Отправьте CSV-файл с объявлениями.\n\n"
             "Формат:\n"
-            "<code>country,title,price,publication,seller,registration,phone,ad_url,image_url,city,category,description</code>",
+            "<code>ad_id,title,price,city,description,url</code>\n\n"
+            "Где ad_id — ID объявления на OLX (для отправки сообщения)",
             parse_mode='HTML',
             reply_markup=back_button()
         )
     
     # ===== РАССЫЛКА =====
     elif query.data == "start_send":
-        await query.edit_message_text("🚀 <b>Подготовка к рассылке...</b>", parse_mode='HTML')
-        
         errors = []
-        if not data['tokens']:
+        if not data['accounts']:
             errors.append("❌ Нет токенов")
         if not data['texts']:
             errors.append("❌ Нет текстов")
         if not data['ads']:
-            errors.append("❌ Нет объявлений (загрузите CSV)")
+            errors.append("❌ Нет объявлений")
         
         if errors:
             await query.edit_message_text(
@@ -285,16 +312,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await query.edit_message_text(
             f"🚀 <b>Начинаю рассылку...</b>\n\n"
+            f"👤 Токенов: {len(data['accounts'])}\n"
             f"📦 Объявлений: {len(data['ads'])}\n"
-            f"🔑 Токенов: {len(data['tokens'])}\n"
             f"📝 Текстов: {len(data['texts'])}\n"
-            f"🌐 Прокси: {len(data['proxies'])}\n"
             f"⏱ Задержка: {data.get('delay', 5)} сек\n\n"
             f"⏳ Пожалуйста, подождите...",
             parse_mode='HTML'
         )
         
-        result = await send_all_ads(context, query.from_user.id)
+        result = await send_all_messages(context, query.from_user.id)
         
         await context.bot.send_message(
             chat_id=query.from_user.id,
@@ -304,8 +330,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     
     elif query.data == "clear_all":
-        data['tokens'] = []
-        data['proxies'] = []
+        data['accounts'] = []
         data['texts'] = []
         data['ads'] = []
         data['delay'] = 5
@@ -313,93 +338,68 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🔄 <b>Все данные очищены</b>", parse_mode='HTML', reply_markup=main_menu())
 
 # ===== ФУНКЦИЯ РАССЫЛКИ =====
-async def send_all_ads(context, chat_id) -> str:
+async def send_all_messages(context, chat_id) -> str:
     ads = data['ads']
     texts = data['texts']
-    tokens = data['tokens']
-    proxies = data['proxies']
+    accounts = data['accounts']
     delay = data.get('delay', 5)
     
     total = len(ads)
     sent = 0
     errors = []
-    banned_tokens = []
     
     for i, ad in enumerate(ads, 1):
         try:
-            text_template = random.choice(texts)
+            # Выбираем случайный токен
+            account = random.choice(accounts)
+            access_token = account['access_token']
             
+            if not access_token:
+                errors.append(f"❌ Токен {account.get('name', 'без имени')}: пустой")
+                continue
+            
+            # Выбираем случайный текст
+            text_template = random.choice(texts)
             message_text = text_template.format(
-                title=ad.get('title', 'Без названия'),
+                title=ad.get('title', 'Объявление'),
                 price=ad.get('price', 'Цена не указана'),
-                city=ad.get('city', 'Не указано'),
-                seller=ad.get('seller', 'Продавец'),
+                city=ad.get('city', ''),
                 description=ad.get('description', '')[:300],
-                url=ad.get('ad_url', '#')
+                url=ad.get('url', '#')
             )
             
-            token = tokens[i % len(tokens)]
+            # Отправляем сообщение
+            result = send_message_via_api(access_token, ad['ad_id'], message_text)
             
-            from telegram import Bot
-            from telegram.request import HTTPXRequest
-            
-            if proxies:
-                proxy = proxies[i % len(proxies)]
-                request = HTTPXRequest(proxy=proxy)
-                bot = Bot(token=token, request=request)
+            if result.get('success'):
+                sent += 1
             else:
-                bot = Bot(token=token)
+                errors.append(f"{i}. {ad.get('title', '')[:30]}: {result.get('error', 'Ошибка')}")
             
-            if ad.get('image_url') and ad['image_url'].startswith('http'):
-                await bot.send_photo(
-                    chat_id=chat_id,
-                    photo=ad['image_url'],
-                    caption=message_text,
-                    parse_mode='HTML'
-                )
-            else:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=message_text,
-                    parse_mode='HTML'
-                )
-            
-            sent += 1
-            
-            # ЗАДЕРЖКА ПОСЛЕ КАЖДОГО ОБЪЯВЛЕНИЯ
             if i < total:
                 await asyncio.sleep(delay)
             
-        except Exception as e:
-            error_msg = str(e)
-            if "Unauthorized" in error_msg or "Invalid token" in error_msg or "Forbidden" in error_msg:
-                banned_tokens.append(token)
-                errors.append(f"❌ Токен {token[:10]}... забанен: {error_msg[:100]}")
-            else:
-                errors.append(f"⚠️ Ошибка в объявлении {i}: {error_msg[:100]}")
+            if i % 5 == 0:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⏳ Прогресс: {i}/{total} отправлено"
+                )
             
-            if len(banned_tokens) == len(tokens):
-                break
+        except Exception as e:
+            errors.append(f"{i}. {str(e)}")
     
     report = f"✅ <b>Рассылка завершена!</b>\n\n"
-    report += f"📦 <b>Статистика:</b>\n"
-    report += f"Всего объявлений: <b>{total}</b>\n"
-    report += f"Отправлено успешно: <b>{sent}</b>\n"
-    report += f"Ошибок: <b>{len(errors)}</b>\n"
+    report += f"📦 Всего: <b>{total}</b>\n"
+    report += f"✅ Отправлено: <b>{sent}</b>\n"
+    report += f"❌ Ошибок: <b>{len(errors)}</b>\n"
     report += f"⏱ Задержка: <b>{delay} сек</b>\n\n"
     
-    if banned_tokens:
-        report += f"🚫 <b>Забаненные токены:</b>\n"
-        for t in banned_tokens:
-            report += f"- <code>{t[:15]}...{t[-5:]}</code>\n"
-        report += f"\n💡 Удалите их через меню.\n\n"
-    
     if errors:
-        report += f"📋 <b>Последние ошибки:</b>\n"
-        for err in errors[:5]:
-            report += f"{err}\n"
-        if len(errors) > 5:
-            report += f"... и ещё {len(errors) - 5} ошибок\n"
+        report += f"📋 <b>Ошибки (первые 10):</b>\n"
+        for err in errors[:10]:
+            report += f"- {err}\n"
+        if len(errors) > 10:
+            report += f"... и ещё {len(errors) - 10} ошибок\n"
     
     return report
 
@@ -412,28 +412,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Используйте /start для открытия меню.")
         return
     
-    text = update.message.text
+    text = update.message.text.strip()
     
-    if action == 'add_token':
-        new_tokens = [t.strip() for t in text.split('\n') if t.strip()]
-        data['tokens'].extend(new_tokens)
-        save_data(data)
-        await update.message.reply_text(
-            f"✅ Добавлено токенов: <b>{len(new_tokens)}</b>\n\nВсего: <b>{len(data['tokens'])}</b>",
-            parse_mode='HTML',
-            reply_markup=main_menu()
-        )
-        user_data['action'] = None
-    
-    elif action == 'add_proxy':
-        new_proxies = [p.strip() for p in text.split('\n') if p.strip()]
-        data['proxies'].extend(new_proxies)
-        save_data(data)
-        await update.message.reply_text(
-            f"✅ Добавлено прокси: <b>{len(new_proxies)}</b>\n\nВсего: <b>{len(data['proxies'])}</b>",
-            parse_mode='HTML',
-            reply_markup=main_menu()
-        )
+    if action == 'add_account':
+        # Формат: Название|access_token
+        parts = text.split('|')
+        if len(parts) >= 2:
+            name = parts[0].strip()
+            token = parts[1].strip()
+            account = {
+                "name": name,
+                "access_token": token,
+                "refresh_token": "",
+                "expires_at": ""
+            }
+            data['accounts'].append(account)
+            save_data(data)
+            await update.message.reply_text(
+                f"✅ <b>Токен добавлен!</b>\n\n"
+                f"👤 {name}\n"
+                f"🔑 <code>{token[:20]}...{token[-10:]}</code>\n\n"
+                f"Всего токенов: <b>{len(data['accounts'])}</b>",
+                parse_mode='HTML',
+                reply_markup=main_menu()
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Неправильный формат.\n\n"
+                "Используйте: <code>Название|access_token</code>\n"
+                "Пример: <code>Мой аккаунт|eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...</code>",
+                parse_mode='HTML',
+                reply_markup=back_button()
+            )
         user_data['action'] = None
     
     elif action == 'add_text':
@@ -469,19 +479,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif action == 'set_delay':
         try:
-            seconds = int(text.strip())
+            seconds = int(text)
             if seconds < 1:
-                await update.message.reply_text("❌ Задержка должна быть больше 0 секунд.")
+                await update.message.reply_text("❌ Задержка должна быть > 0")
                 return
             data['delay'] = seconds
             save_data(data)
-            await update.message.reply_text(
-                f"✅ Задержка установлена: <b>{seconds} сек</b>",
-                parse_mode='HTML',
-                reply_markup=main_menu()
-            )
+            await update.message.reply_text(f"✅ Задержка: {seconds} сек", reply_markup=main_menu())
         except ValueError:
-            await update.message.reply_text("❌ Введите число (например, 10)")
+            await update.message.reply_text("❌ Введите число")
         user_data['action'] = None
 
 async def handle_csv_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -510,38 +516,38 @@ async def handle_csv_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка: {str(e)}")
 
 def parse_csv_text(content: str) -> list:
+    """Парсит CSV в список объявлений"""
     lines = content.strip().split('\n')
     if len(lines) < 2:
         return []
     
     header = lines[0].strip().split(',')
     try:
+        ad_id_idx = header.index('ad_id')
         title_idx = header.index('title')
-        price_idx = header.index('price')
-        ad_url_idx = header.index('ad_url')
-        image_url_idx = header.index('image_url')
-        city_idx = header.index('city')
-        description_idx = header.index('description')
-        seller_idx = header.index('seller')
+        price_idx = header.index('price') if 'price' in header else None
+        city_idx = header.index('city') if 'city' in header else None
+        description_idx = header.index('description') if 'description' in header else None
+        url_idx = header.index('url') if 'url' in header else None
     except ValueError:
-        title_idx, price_idx, ad_url_idx, image_url_idx, city_idx, description_idx, seller_idx = 1, 2, 7, 8, 9, 11, 5
+        # Если нет заголовков — по порядку
+        return []
     
     ads = []
     for line in lines[1:]:
         if not line.strip():
             continue
         parts = line.split(',')
-        if len(parts) < 12:
-            continue
-        ads.append({
-            'title': parts[title_idx] if title_idx < len(parts) else "Без названия",
-            'price': parts[price_idx] if price_idx < len(parts) else "Цена не указана",
-            'ad_url': parts[ad_url_idx] if ad_url_idx < len(parts) else "#",
-            'image_url': parts[image_url_idx] if image_url_idx < len(parts) else "",
-            'city': parts[city_idx] if city_idx < len(parts) else "Не указано",
-            'description': parts[description_idx] if description_idx < len(parts) else "",
-            'seller': parts[seller_idx] if seller_idx < len(parts) else "Продавец"
-        })
+        ad = {
+            'ad_id': parts[ad_id_idx] if ad_id_idx < len(parts) else '',
+            'title': parts[title_idx] if title_idx < len(parts) else '',
+            'price': parts[price_idx] if price_idx is not None and price_idx < len(parts) else '',
+            'city': parts[city_idx] if city_idx is not None and city_idx < len(parts) else '',
+            'description': parts[description_idx] if description_idx is not None and description_idx < len(parts) else '',
+            'url': parts[url_idx] if url_idx is not None and url_idx < len(parts) else ''
+        }
+        if ad['ad_id']:
+            ads.append(ad)
     return ads
 
 # ===== ЗАПУСК =====
@@ -550,7 +556,6 @@ def main():
     
     if not BOT_TOKEN:
         print("❌ Ошибка: BOT_TOKEN не найден в переменных окружения!")
-        print("Добавьте переменную BOT_TOKEN в Render (Environment → Environment Variables)")
         return
     
     app = Application.builder().token(BOT_TOKEN).build()
@@ -564,4 +569,5 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
+    import random
     main()
